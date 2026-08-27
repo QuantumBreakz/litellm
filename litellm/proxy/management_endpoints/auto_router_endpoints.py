@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, field_validator
 
 from litellm._logging import verbose_proxy_logger
 from litellm.exceptions import BudgetExceededError
-from litellm.litellm_core_utils.llm_judge import router_resolves_model
+from litellm.litellm_core_utils.llm_judge import answering_models, router_resolves_model
 from litellm.proxy._types import (
     CommonProxyErrors,
     LiteLLM_TeamTable,
@@ -36,7 +36,11 @@ from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
 from litellm.repositories.base_repository import SupportsModelDump
 from litellm.repositories.team_repository import TeamRepository
 from litellm.router_strategy.complexity_router import ComplexityRouter
-from litellm.router_utils.auto_router_model_naming import classify_strategy_router_model
+from litellm.router_utils.auto_router_model_naming import (
+    StrategyRouterDependencyRole,
+    classify_strategy_router_model,
+    strategy_router_dependencies,
+)
 from litellm.types.management_endpoints.auto_router_endpoints import (
     SHADOW_EVAL_TURN_VALVE,
     AutoRouterBenchmarkGroup,
@@ -680,6 +684,69 @@ def _validate_plain_model(llm_router: "Router | None", model: str, field_name: s
         ) from e
 
 
+_JUDGED_ROLES: Final[frozenset[StrategyRouterDependencyRole]] = frozenset({"tier", "default"})
+
+
+def _router_arm_models(llm_router: "Router | None", router_name: str) -> tuple[tuple[str, str], ...]:
+    """``(role, model_name)`` for every model the router under evaluation can answer with.
+
+    Drawn from ``strategy_router_dependencies``, the single answer to "what does this router
+    call", so this cannot disagree with the health check's reading of the same deployment.
+    Only the roles that SERVE are arms: the classifier and embedding models pick the tier,
+    they never produce a response anyone judges, so a judge sharing them carries no
+    self-preference.
+
+    A semantic auto-router keeps its routes in an opaque config blob or a file, so only its
+    default model is enumerable and the guard below is incomplete for it. That direction is
+    deliberate: it can miss a collision, never invent one.
+    """
+    deployments: Final = llm_router.get_model_list(model_name=router_name) if llm_router is not None else None
+    return tuple(
+        dict.fromkeys(
+            (dependency.role, dependency.model_name)
+            for deployment in deployments or ()
+            for dependency in strategy_router_dependencies(deployment["litellm_params"])
+            if dependency.role in _JUDGED_ROLES
+        )
+    )
+
+
+def _validate_judge_is_not_a_candidate(llm_router: "Router | None", data: StartShadowEvalRequest) -> None:
+    """Reject a judge that is one of the two arms it grades.
+
+    A judge scores its own output higher than a rival's, so a run whose judge also serves an
+    arm reports a win rate for that arm that measures the judge rather than the models, and
+    the whole job's spend buys a result that has to be discarded. Both arms are in scope: the
+    router answers with a tier or default model in either direction, and a reverse job's
+    ``baseline_model`` is the fixed arm the router is compared against.
+
+    Names are compared by what would ANSWER them, not by spelling: the shipped default judge
+    ``anthropic/claude-sonnet-5`` collides with a tier deployment an admin named
+    ``sonnet-tier``, and an alias collides with its target, neither of which a string
+    comparison sees.
+    """
+    judge: Final = answering_models(llm_router, data.judge_model)
+    collisions: Final = tuple(
+        (role, model)
+        for role, model in (
+            *_router_arm_models(llm_router, data.router_name),
+            *((("baseline", data.baseline_model),) if data.baseline_model is not None else ()),
+        )
+        if judge & answering_models(llm_router, model)
+    )
+    if not collisions:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"judge_model '{data.judge_model}' is also an arm this job would judge: "
+            + ", ".join(f"{role} model '{model}'" for role, model in collisions)
+            + ". A judge scores its own answers higher than a rival's, so the win rates would "
+            "measure the judge; pick a judge that serves neither arm"
+        ),
+    )
+
+
 def _is_unique_violation(error: Exception) -> bool:
     """Whether a Prisma create failed on a unique index. One active job per key and
     direction lives in a partial unique index (raw SQL in the migration; schema.prisma
@@ -1015,6 +1082,7 @@ async def start_shadow_eval(
     _validate_plain_model(llm_router, data.judge_model, "judge_model")
     if data.baseline_model is not None:
         _validate_plain_model(llm_router, data.baseline_model, "baseline_model")
+    _validate_judge_is_not_a_candidate(llm_router, data)
     token_rows: Final = await _verification_tokens(prisma_client).find_many(
         where={"token": {"in": list(data.api_key_ids)}}  # mutable-ok: Prisma filter
     )

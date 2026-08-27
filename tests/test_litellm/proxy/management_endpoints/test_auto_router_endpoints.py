@@ -639,15 +639,51 @@ VIEWER = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY, api_ke
 NON_ADMIN = UserAPIKeyAuth(user_role=LitellmUserRoles.INTERNAL_USER, api_key="sk-user", user_id="user")
 
 
-def _shadow_router() -> MagicMock:
-    router = MagicMock()
-    router.auto_routers = {}
-    router.complexity_routers = {"my-router": [MagicMock()]}
-    router.adaptive_routers = {}
-    router.quality_routers = {}
-    router.model_group_alias = {}
-    router.get_model_list = MagicMock(return_value=None)
-    return router
+def _complexity_router_deployment(
+    model_name: str, tiers: dict[str, str], default: str, classifier: str = "cheap"
+) -> dict[str, object]:
+    return {
+        "model_name": model_name,
+        "litellm_params": {
+            "model": "auto_router/complexity_router",
+            "complexity_router_default_model": default,
+            "complexity_router_config": {
+                "tiers": tiers,
+                "classifier_type": "llm",
+                "classifier_llm_config": {"model": classifier},
+                "session_affinity": False,
+            },
+        },
+    }
+
+
+def _shadow_router() -> Router:
+    """A real Router, so the endpoint's model checks run against real resolution.
+
+    `sonnet-router` exists to keep the judge-vs-candidate cases honest: its tiers are
+    deployments named nothing like the shipped default judge, yet one of them serves
+    `anthropic/claude-sonnet-5`, so only a check that resolves names finds the collision.
+    `my-router` deliberately serves none of it, since the default judge has to stay valid
+    for every other test in this file.
+    """
+    return Router(
+        model_list=[
+            {"model_name": "cheap", "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "fake"}},
+            {"model_name": "mid", "litellm_params": {"model": "openai/gpt-4o", "api_key": "fake"}},
+            {"model_name": "pricey", "litellm_params": {"model": "openai/o3", "api_key": "fake"}},
+            {"model_name": "house-sonnet", "litellm_params": {"model": "anthropic/claude-sonnet-5", "api_key": "fake"}},
+            _complexity_router_deployment(
+                "my-router", {"SIMPLE": "cheap", "MEDIUM": "mid", "COMPLEX": "pricey"}, "mid"
+            ),
+            _complexity_router_deployment(
+                "sonnet-router", {"SIMPLE": "cheap", "MEDIUM": "house-sonnet"}, "cheap"
+            ),
+            _complexity_router_deployment(
+                "classifier-router", {"SIMPLE": "cheap"}, "cheap", classifier="pricey"
+            ),
+        ],
+        model_group_alias={"judge-alias": "pricey"},
+    )
 
 
 def _leg_record(**overrides: object) -> MagicMock:
@@ -852,6 +888,11 @@ async def test_start_shadow_eval_writes_one_leg_per_key_in_one_statement(monkeyp
         (ADMIN, {"direction": "reverse", "baseline_model": "my-router"}, (), 400),
         (ADMIN, {"direction": "reverse", "baseline_model": "not/a real model!"}, (), 400),
         (ADMIN, {"direction": "reverse", "baseline_model": "openai/gpt-4o", "router_name": "not-a-router"}, (), 400),
+        (ADMIN, {"judge_model": "pricey"}, (), 400),
+        (ADMIN, {"judge_model": "mid"}, (), 400),
+        (ADMIN, {"judge_model": "judge-alias"}, (), 400),
+        (ADMIN, {"router_name": "sonnet-router"}, (), 400),
+        (ADMIN, {"direction": "reverse", "baseline_model": "house-sonnet"}, (), 400),
     ],
     ids=[
         "non-admin",
@@ -864,6 +905,11 @@ async def test_start_shadow_eval_writes_one_leg_per_key_in_one_statement(monkeyp
         "router-as-baseline",
         "unresolvable-baseline",
         "reverse-still-needs-an-auto-router",
+        "judge-is-a-tier-model",
+        "judge-is-the-routers-default-model",
+        "judge-alias-resolves-to-a-tier-model",
+        "default-judge-is-what-a-tier-deployment-serves",
+        "judge-is-what-the-reverse-baseline-serves",
     ],
 )
 async def test_start_shadow_eval_rejections(
@@ -879,6 +925,68 @@ async def test_start_shadow_eval_rejections(
         await start_shadow_eval(_start_request(**request_overrides), caller)
     assert exc.value.status_code == expected_status
     prisma.db.litellm_shadowevaljob.create_many.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_overrides",
+    [
+        {"judge_model": "house-sonnet"},
+        {"judge_model": "anthropic/claude-opus-4-5"},
+        {"router_name": "sonnet-router", "judge_model": "pricey"},
+        {"router_name": "classifier-router", "judge_model": "pricey"},
+        {"direction": "reverse", "baseline_model": "house-sonnet", "judge_model": "openai/gpt-4.1"},
+    ],
+    ids=[
+        "judge-serves-a-model-no-tier-serves",
+        "judge-is-an-unconfigured-public-name",
+        "judge-is-a-tier-of-a-DIFFERENT-router",
+        "judge-is-only-the-routers-classifier",
+        "reverse-judge-differs-from-both-arms",
+    ],
+)
+async def test_start_shadow_eval_accepts_a_judge_that_serves_neither_arm(
+    monkeypatch: pytest.MonkeyPatch, request_overrides
+):
+    """The negative class of the judge-as-candidate gate.
+
+    Without these, a gate that refused every judge would pass the rejection table above
+    while making the endpoint useless.
+    """
+    import litellm.proxy.proxy_server as proxy_server
+
+    prisma = _shadow_prisma()
+    monkeypatch.setattr(proxy_server, "prisma_client", prisma)
+    monkeypatch.setattr(proxy_server, "llm_router", _shadow_router())
+
+    response = await start_shadow_eval(_start_request(**request_overrides), ADMIN)
+
+    assert response.job_id
+    prisma.db.litellm_shadowevaljob.create_many.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_start_shadow_eval_names_the_colliding_arm_by_the_deployment_the_admin_configured(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The gate compares what would ANSWER each name, not the names themselves.
+
+    `anthropic/claude-sonnet-5` shares no substring with the deployment `house-sonnet` that
+    serves it, so a spelling comparison accepts this job and the run's whole budget buys a
+    result that has to be discarded. The detail has to name the deployment, since that is
+    the thing the admin can go and change.
+    """
+    import litellm.proxy.proxy_server as proxy_server
+
+    monkeypatch.setattr(proxy_server, "prisma_client", _shadow_prisma())
+    monkeypatch.setattr(proxy_server, "llm_router", _shadow_router())
+
+    with pytest.raises(HTTPException) as exc:
+        await start_shadow_eval(_start_request(router_name="sonnet-router"), ADMIN)
+
+    assert exc.value.status_code == 400
+    assert "house-sonnet" in str(exc.value.detail)
+    assert "anthropic/claude-sonnet-5" in str(exc.value.detail)
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import litellm
 from litellm.litellm_core_utils.llm_judge import (
+    answering_models,
     extract_text_from_content,
     judge_acompletion,
     parse_json_verdict,
@@ -90,3 +92,37 @@ async def test_judge_acompletion_falls_back_to_sdk_for_unconfigured_model(monkey
     assert sdk.call_args.kwargs["model"] == "anthropic/claude-sonnet-5"
     assert sdk.call_args.kwargs["num_retries"] == 0
     assert sdk.call_args.kwargs["drop_params"] is True
+
+
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        ("named-deployment", frozenset({"anthropic/claude-sonnet-5"})),
+        ("alias-for-it", frozenset({"anthropic/claude-sonnet-5"})),
+        ("anthropic/claude-sonnet-5", frozenset({"anthropic/claude-sonnet-5"})),
+        ("anthropic/claude-opus-4-5", frozenset({"anthropic/claude-opus-4-5"})),
+    ],
+    ids=["deployment", "alias", "the-public-name-the-deployment-serves", "nothing-configured"],
+)
+def test_answering_models_identifies_a_name_by_what_would_serve_it(model, expected):
+    """Three spellings of one model must come back as one identity, or a caller comparing
+    two names by their answering models would call the same model two different ones.
+
+    The last case is the fallback: nothing on the proxy serves it, so the SDK gets the name
+    verbatim and the name is the identity.
+    """
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "named-deployment",
+                "litellm_params": {"model": "anthropic/claude-sonnet-5", "api_key": "fake"},
+            }
+        ],
+        model_group_alias={"alias-for-it": "named-deployment"},
+    )
+
+    assert answering_models(router, model) == expected
+
+
+def test_answering_models_without_a_router_is_the_name_itself():
+    assert answering_models(None, "anthropic/claude-sonnet-5") == frozenset({"anthropic/claude-sonnet-5"})

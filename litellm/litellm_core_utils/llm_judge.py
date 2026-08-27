@@ -63,6 +63,19 @@ def router_resolves_model(router: Router | None, model: str) -> bool:
     return router is not None and bool(model in router.model_group_alias or router.get_model_list(model_name=model))
 
 
+def answering_models(router: Router | None, model: str) -> frozenset[str]:
+    """The provider models that would actually answer a call to `model` on this proxy.
+
+    Mirrors `judge_acompletion`'s two arms, which is what makes it the right identity to
+    compare two names by: a configured name is served by its deployments, so it IS their
+    underlying provider models (`Router.resolved_litellm_models`); a name with no deployment
+    behind it goes to the SDK verbatim, so it is itself. Comparing the raw names instead
+    would call two spellings of one model different - `anthropic/claude-sonnet-5` and a
+    deployment named `sonnet-tier` that serves it are the same model answering.
+    """
+    return frozenset(router.resolved_litellm_models(model) if router is not None else ()) or frozenset({model})
+
+
 async def judge_acompletion(
     router: Router | None,
     judge_model: str,
