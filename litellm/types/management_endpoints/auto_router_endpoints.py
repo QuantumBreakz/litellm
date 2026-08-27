@@ -2,8 +2,9 @@
 Types for auto-router management endpoints
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Final, Literal, TypeAlias
 
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
@@ -44,9 +45,30 @@ class ComplexityRouterConfigValidationResponse(BaseModel):
 
 
 class AutoRouterRoutingTestRequest(BaseModel):
-    """A single prompt to classify against a complexity-router config that need not be saved yet."""
+    """A single request to classify against a complexity-router config that need not be saved yet.
 
-    prompt: str = Field(description="The prompt to route, as an end user would send it")
+    Carries the same fields the serving path carries, so a dry run classifies what a real turn
+    would classify. `messages`, `system` and `tools` are forwarded to the routing hook untranslated,
+    which is why they are typed loosely: the hook reads whatever dialect the surface produced, and
+    validating them against one surface's schema would reject the others.
+    """
+
+    prompt: str | None = Field(
+        default=None,
+        description="A single ask to route, as an end user would send it. Mutually exclusive with messages",
+    )
+    messages: Sequence[Mapping[str, object]] | None = Field(
+        default=None,
+        description="The full message list to route, exactly as the serving path would receive it. Mutually exclusive with prompt",
+    )
+    system: str | Sequence[Mapping[str, object]] | None = Field(
+        default=None,
+        description="The top-level system prompt an Anthropic /v1/messages body carries beside its messages",
+    )
+    tools: Sequence[Mapping[str, object]] | None = Field(
+        default=None,
+        description="The tool definitions the request advertises, which decide whether the plan-mode floor applies",
+    )
     complexity_router_config: RequestComplexityRouterConfig = Field(
         description="The complexity router config to route against, in the shape /model/new accepts",
     )
@@ -63,12 +85,38 @@ class AutoRouterRoutingTestRequest(BaseModel):
         description="Team the router is being created for. Required for a team admin, who may only test their own team's routers",
     )
 
-    @field_validator("prompt")
-    @classmethod
-    def _require_non_blank_prompt(cls, value: str) -> str:
-        if not value.strip():
+    @model_validator(mode="after")
+    def _resolve_request_carrier(self) -> "AutoRouterRoutingTestRequest":
+        if self.prompt is not None and not self.prompt.strip():
             raise ValueError("prompt must not be blank")
-        return value
+        if self.messages is not None and not self.messages:
+            raise ValueError("messages must not be empty")
+        if (self.prompt is None) == (self.messages is None):
+            raise ValueError("provide exactly one of prompt or messages")
+        if self.messages is not None:
+            return self
+        return self.model_copy(
+            update={  # mutable-ok: model_copy types update as a plain dict
+                "messages": [  # mutable-ok: the routing hook's signature takes a list of message dicts
+                    {"role": "user", "content": self.prompt}  # mutable-ok: a message is dict-shaped
+                ]
+            }
+        )
+
+    def wire_body(self) -> Mapping[str, object]:
+        """The request kwargs a serving-path request would carry for this body.
+
+        Every value is handed out by identity rather than copied, so the messages the routing hook
+        classifies and the messages its raw-body plan-mode scan reads are one value, as they are on
+        the serving path.
+        """
+        return MappingProxyType(
+            {  # mutable-ok: MappingProxyType needs a dict to wrap
+                key: value
+                for key, value in (("messages", self.messages), ("system", self.system), ("tools", self.tools))
+                if value is not None
+            }
+        )
 
 
 class AutoRouterRoutingTestResponse(BaseModel):
